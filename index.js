@@ -32,7 +32,9 @@ async function hubspot(token, path, method = 'GET', body = null) {
   return data;
 }
 
-async function appendEp(token, contactId, propertyName, epValue) {
+// Append a value into a semicolon-separated contact property (dedup).
+// Returns true if the property was updated, false if the value already existed.
+async function appendValue(token, contactId, propertyName, value) {
   const contact = await hubspot(
     token,
     `/crm/v3/objects/contacts/${contactId}?properties=${propertyName}`
@@ -41,13 +43,15 @@ async function appendEp(token, contactId, propertyName, epValue) {
   const current = contact?.properties?.[propertyName] || '';
   const list = current ? current.split(';').map(s => s.trim()).filter(Boolean) : [];
 
-  if (list.includes(epValue)) return; // ซ้ำ ไม่ต้องอัปเดต
+  if (list.includes(value)) return false; // already present → skip cleanly (no more ß bug)
 
-  list.push(epValue);
+  list.push(value);
 
   await hubspot(token, `/crm/v3/objects/contacts/${contactId}`, 'PATCH', {
     properties: { [propertyName]: list.join(';') },
   });
+
+  return true;
 }
 
 export default {
@@ -68,10 +72,10 @@ export default {
       return json({ error: 'Invalid JSON' }, 400);
     }
 
-    const { contactId, action, ep, property } = body;
+    const { contactId, action } = body;
 
-    if (!contactId || !action || !ep) {
-      return json({ error: 'contactId, action และ ep จำเป็นต้องมี' }, 400);
+    if (!contactId || action !== 'visit') {
+      return json({ error: 'contactId และ action: "visit" จำเป็นต้องมี' }, 400);
     }
 
     const token = env.HUBSPOT_TOKEN;
@@ -79,17 +83,35 @@ export default {
       return json({ error: 'HUBSPOT_TOKEN not configured' }, 500);
     }
 
-    // property name — default เป็น ebook_register ถ้าไม่ได้ส่งมา
-    const propertyName = property || 'ebook_register';
+    // Normalise the payload into a list of { property, value } pairs.
+    // รองรับ 2 รูปแบบ:
+    //   1) แบบเดิม:  { ep, property }                        → 1 property (default = main_campaign)
+    //   2) แบบใหม่:  { items: [{ property, value }, ...] }    → หลาย property ในครั้งเดียว
+    let rawItems;
+    if (Array.isArray(body.items)) {
+      rawItems = body.items;
+    } else {
+      rawItems = [{ property: body.property || 'main_campaign', value: body.ep }];
+    }
+
+    const items = rawItems
+      .map(it => ({
+        property: String(it.property || '').trim(),
+        value: String(it.value ?? it.ep ?? '').trim(),
+      }))
+      .filter(it => it.property && it.value);
+
+    if (items.length === 0) {
+      return json({ error: 'ต้องมีอย่างน้อย 1 property พร้อม value' }, 400);
+    }
 
     try {
-      if (action === 'visit') {
-        await appendEp(token, contactId, propertyName, ep);
-      } else {
-        return json({ error: `action ไม่รู้จัก: ${action}` }, 400);
+      const results = [];
+      for (const { property, value } of items) {
+        const updated = await appendValue(token, contactId, property, value);
+        results.push({ property, value, updated });
       }
-
-      return json({ success: true, property: propertyName, ep });
+      return json({ success: true, results });
     } catch (err) {
       console.error('[track]', err.message);
       return json({ error: 'Internal server error' }, 500);
